@@ -1,0 +1,475 @@
+# Install dependencies
+!pip install -q pymupdf gradio transformers torch
+
+import fitz
+import re
+import textwrap
+import torch
+import gradio as gr
+from transformers import pipeline
+from difflib import SequenceMatcher
+
+class AccurateTextbookSummarizer:
+    def __init__(self):
+        self.device = 0 if torch.cuda.is_available() else -1
+        self.summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=self.device
+        )
+        
+        # Spelling correction dictionary
+        self.programming_topics = {
+            'functions': ['function', 'def', 'method', 'procedure'],
+            'variables': ['variable', 'assignment', 'declare', 'value'],
+            'tuples': ['tuple', 'immutable', 'parentheses'],
+            'lists': ['list', 'array', 'collection', 'mutable'],
+            'loops': ['loop', 'for', 'while', 'iteration'],
+            'classes': ['class', 'object', 'oop', 'method'],
+            'dictionaries': ['dictionary', 'dict', 'key-value'],
+            'inheritance': ['inheritance', 'inherit', 'parent'],
+            'modules': ['module', 'import', 'package'],
+            'exceptions': ['exception', 'try', 'except', 'error']
+        }
+        
+        self.common_misspellings = {
+            'functons': 'functions', 'functios': 'functions', 'funtions': 'functions',
+            'tiples': 'tuples', 'tupes': 'tuples', 'tupples': 'tuples',
+            'variales': 'variables', 'varibles': 'variables', 'variabels': 'variables',
+            'lopos': 'loops', 'lops': 'loops', 'loops': 'loops',
+            'clases': 'classes', 'clasess': 'classes', 'classess': 'classes',
+            'dictonaries': 'dictionaries', 'dictionaris': 'dictionaries',
+            'functon': 'functions', 'tupel': 'tuples', 'var': 'variables',
+            'func': 'functions', 'cls': 'classes', 'dict': 'dictionaries'
+        }
+        
+        print("✅ BART model loaded successfully")
+
+    def correct_spelling(self, user_topic: str) -> str:
+        """Correct spelling mistakes in the topic"""
+        user_topic_lower = user_topic.lower().strip()
+        
+        # Direct match first
+        if user_topic_lower in self.programming_topics:
+            return user_topic_lower
+        
+        # Check common misspellings
+        if user_topic_lower in self.common_misspellings:
+            corrected = self.common_misspellings[user_topic_lower]
+            print(f"🔤 Spelling corrected: '{user_topic}' -> '{corrected}'")
+            return corrected
+        
+        # Fuzzy matching
+        best_match = None
+        best_score = 0
+        
+        for correct_topic in self.programming_topics.keys():
+            similarity = SequenceMatcher(None, user_topic_lower, correct_topic).ratio()
+            if similarity > best_score:
+                best_score = similarity
+                best_match = correct_topic
+        
+        if best_score > 0.6:
+            print(f"🔤 Fuzzy match: '{user_topic}' -> '{best_match}' (score: {best_score:.2f})")
+            return best_match
+        
+        return user_topic_lower
+
+    def summarize_topic(self, pdf_path: str, topic: str) -> dict:
+        """Accurate textbook summarization with precise content targeting"""
+        try:
+            # Spelling correction
+            corrected_topic = self.correct_spelling(topic)
+            original_topic = topic
+            topic = corrected_topic
+            
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+
+            print(f"📖 Analyzing PDF with {total_pages} pages...")
+            print(f"🔍 Searching for: '{topic}' (from '{original_topic}')")
+
+            # STRATEGY 1: Find exact chapter content
+            chapter_content = self._find_exact_chapter_content(doc, topic, total_pages)
+            if chapter_content:
+                doc.close()
+                chapter_content['original_topic'] = original_topic
+                chapter_content['corrected_topic'] = corrected_topic
+                return chapter_content
+
+            # STRATEGY 2: Precise content search
+            precise_result = self._precise_content_search(doc, topic)
+            doc.close()
+            precise_result['original_topic'] = original_topic
+            precise_result['corrected_topic'] = corrected_topic
+            return precise_result
+
+        except Exception as e:
+            return {
+                'success': False,
+                'summary': f"❌ Error: {str(e)}",
+                'pages_used': 'Error',
+                'method': 'error'
+            }
+
+    def _find_exact_chapter_content(self, doc, topic: str, total_pages: int) -> dict:
+        """Find and extract content from the exact chapter"""
+        # Find chapter page from TOC
+        chapter_page = self._find_chapter_from_toc(doc, topic, total_pages)
+        
+        if chapter_page:
+            print(f"🎯 Found '{topic}' chapter at page {chapter_page}")
+            
+            # Extract focused content from chapter
+            content = self._extract_focused_chapter_content(doc, chapter_page, topic)
+            
+            if content and len(content) > 400:
+                summary = self._summarize_with_bart(content)
+                return {
+                    'success': True,
+                    'summary': summary,
+                    'pages_used': f"{chapter_page}-{chapter_page + 8}",  # Reasonable range
+                    'method': 'exact_chapter',
+                    'confidence': 'high',
+                    'content_length': len(content)
+                }
+        
+        return None
+
+    def _find_chapter_from_toc(self, doc, topic: str, total_pages: int) -> int:
+        """Find chapter page from table of contents"""
+        # Search first 20 pages for TOC
+        for page_num in range(min(20, total_pages)):
+            text = doc[page_num].get_text()
+            lines = text.split('\n')
+            
+            for line in lines:
+                line_clean = line.strip()
+                
+                # Look for chapter patterns
+                patterns = [
+                    r'^(\d+)\s+([A-Za-z].+?)\s+(\d{2,4})$',  # "5 Loops 139"
+                    r'^([A-Z][a-zA-Z].+?)\s+(\d{2,4})$',     # "Loops 139"
+                ]
+                
+                for pattern in patterns:
+                    match = re.match(pattern, line_clean)
+                    if match:
+                        groups = match.groups()
+                        if len(groups) == 3:
+                            chapter_name = groups[1].strip().lower()
+                            page_num_found = int(groups[2])
+                        elif len(groups) == 2:
+                            chapter_name = groups[0].strip().lower()
+                            page_num_found = int(groups[1])
+                        else:
+                            continue
+                        
+                        if topic in chapter_name:
+                            return page_num_found
+        
+        return None
+
+    def _extract_focused_chapter_content(self, doc, start_page: int, topic: str) -> str:
+        """Extract focused content from chapter pages"""
+        content_parts = []
+        
+        # Extract 8-10 pages from chapter start
+        end_page = min(start_page + 9, len(doc))
+        
+        print(f"📄 Extracting focused content from pages {start_page}-{end_page}")
+        
+        for page_num in range(start_page - 1, end_page):
+            text = doc[page_num].get_text()
+            if text:
+                # Extract only topic-specific content
+                topic_content = self._extract_topic_specific_content(text, topic)
+                if topic_content:
+                    content_parts.append(topic_content)
+        
+        return "\n\n".join(content_parts)
+
+    def _extract_topic_specific_content(self, text: str, topic: str) -> str:
+        """Extract only content specifically about the topic"""
+        lines = text.split('\n')
+        topic_lines = []
+        in_topic_section = False
+        
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 10:
+                continue
+            
+            line_lower = line_clean.lower()
+            
+            # Check if this line starts the topic section
+            if (topic in line_lower and 
+                len(line_clean) < 150 and
+                not any(exclude in line_lower for exclude in ['exercise', 'problem', 'question'])):
+                in_topic_section = True
+                topic_lines.append(f"🎯 {line_clean}")  # Mark section start
+            
+            # Collect lines when in topic section
+            if in_topic_section:
+                # Stop if we hit a new section or exercise
+                if (self._is_new_section(line_clean) and 
+                    topic not in line_lower):
+                    break
+                
+                # Only keep educational content about the topic
+                if self._is_topic_educational_content(line_clean, topic):
+                    topic_lines.append(line_clean)
+            
+            # Also collect standalone topic mentions with context
+            elif topic in line_lower and self._is_educational(line_clean):
+                topic_lines.append(line_clean)
+        
+        return ' '.join(topic_lines[:20])  # Limit to maintain focus
+
+    def _is_topic_educational_content(self, line: str, topic: str) -> bool:
+        """Check if line contains educational content about the specific topic"""
+        line_lower = line.lower()
+        
+        # Skip non-educational content
+        if self._is_non_educational(line):
+            return False
+        
+        # Topic-specific content checks
+        if topic == 'variables':
+            return any(keyword in line_lower for keyword in 
+                      ['variable', 'assignment', '=', 'declare', 'name', 'value', 'store'])
+        
+        elif topic == 'lists':
+            return any(keyword in line_lower for keyword in 
+                      ['list', '[]', 'append', 'pop', 'mutable', 'element', 'sequence'])
+        
+        elif topic == 'objects':
+            return any(keyword in line_lower for keyword in 
+                      ['object', 'class', 'instance', 'attribute', 'method', 'self'])
+        
+        elif topic == 'functions':
+            return any(keyword in line_lower for keyword in 
+                      ['def ', 'function', 'parameter', 'argument', 'return', 'call'])
+        
+        # General educational content
+        return self._is_educational(line)
+
+    def _is_new_section(self, line: str) -> bool:
+        """Check if line indicates a new section"""
+        new_section_indicators = [
+            len(line) < 100,
+            line.strip().isupper(),
+            any(keyword in line.lower() for keyword in 
+                ['exercise', 'problem', 'example', 'summary', 'next', 'chapter'])
+        ]
+        return sum(new_section_indicators) >= 2
+
+    def _precise_content_search(self, doc, topic: str) -> dict:
+        """Precise content search that finds actual educational content"""
+        relevant_pages = []
+        topic_content = []
+        
+        print(f"🔍 Precise search for '{topic}'...")
+        
+        for page_num in range(len(doc)):
+            text = doc[page_num].get_text()
+            if not text:
+                continue
+            
+            # Check if page contains substantial topic content
+            if self._page_has_substantial_topic_content(text, topic):
+                content = self._extract_topic_specific_content(text, topic)
+                if content:
+                    topic_content.append(f"📖 Page {page_num + 1}:\n{content}")
+                    relevant_pages.append(page_num + 1)
+                    
+                    # Stop when we have enough quality content
+                    if len(relevant_pages) >= 4:
+                        break
+        
+        if topic_content and len(topic_content) > 0:
+            full_content = "\n\n".join(topic_content)
+            summary = self._summarize_with_bart(full_content)
+            
+            # Reasonable page range
+            if len(relevant_pages) > 1:
+                pages_str = f"{relevant_pages[0]}-{relevant_pages[-1]}"
+            else:
+                pages_str = str(relevant_pages[0])
+            
+            return {
+                'success': True,
+                'summary': summary,
+                'pages_used': pages_str,
+                'method': 'precise_search',
+                'confidence': 'medium',
+                'content_length': len(full_content)
+            }
+        else:
+            return {
+                'success': False,
+                'summary': f"❌ No substantial content found about '{topic}'.\n\nThe topic might be covered in a different chapter name.",
+                'pages_used': 'None',
+                'method': 'not_found'
+            }
+
+    def _page_has_substantial_topic_content(self, text: str, topic: str) -> bool:
+        """Check if page has substantial content about the topic"""
+        lines = text.split('\n')
+        topic_mentions = 0
+        educational_lines = 0
+        
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 20:
+                continue
+            
+            line_lower = line_clean.lower()
+            
+            if topic in line_lower:
+                topic_mentions += 1
+            
+            if self._is_topic_educational_content(line_clean, topic):
+                educational_lines += 1
+        
+        # Require multiple mentions and educational content
+        return topic_mentions >= 2 and educational_lines >= 1
+
+    def _is_non_educational(self, line: str) -> bool:
+        """Check if line is non-educational content"""
+        non_educational = [
+            'exercise', 'problem', 'question', 'homework', 'quiz',
+            'multiple choice', 'true or false', 'fill in the blank',
+            'what is the output', 'predict the output',
+            'page', 'chapter', 'copyright', 'contents',
+            'in the next chapter', 'we will learn later',
+            'as we will see', 'beyond the scope', 'access for free',
+            'learning objectives', 'animation videos', 'docstring'
+        ]
+        
+        line_lower = line.lower()
+        return any(phrase in line_lower for phrase in non_educational)
+
+    def _is_educational(self, line: str) -> bool:
+        """Check if line contains educational content"""
+        educational_indicators = [
+            'def ', 'function', 'class ', 'import ', 'variable', 'loop',
+            'list', 'tuple', 'dictionary', 'parameter', 'return', 'if ',
+            'for ', 'while ', 'definition', 'syntax', 'example', 'create',
+            'method', 'attribute', 'object', 'module', 'package'
+        ]
+        
+        line_lower = line.lower()
+        return any(indicator in line_lower for indicator in educational_indicators)
+
+    def _summarize_with_bart(self, content: str) -> str:
+        """Summarize content using BART"""
+        if len(content) < 300:
+            return "Not enough focused content for summarization."
+        
+        try:
+            if len(content) > 1500:
+                content = content[:1500] + "..."
+            
+            summary = self.summarizer(
+                content,
+                max_length=300,
+                min_length=150,
+                do_sample=False
+            )[0]['summary_text']
+            return summary
+            
+        except Exception as e:
+            print(f"BART summarization issue: {e}")
+            # Extract key educational sentences
+            sentences = [s.strip() for s in content.split('.') if len(s.strip()) > 30]
+            return '. '.join(sentences[:4]) + '.' if sentences else content[:500] + "..."
+
+# Initialize the accurate summarizer
+summarizer = AccurateTextbookSummarizer()
+
+def accurate_handler(uploaded_file, topic):
+    """Handler with precise content targeting"""
+    if uploaded_file is None:
+        return "❌ Please upload a PDF file", "Waiting for file..."
+
+    try:
+        pdf_path = uploaded_file.name
+
+        result = summarizer.summarize_topic(pdf_path, topic)
+
+        # Create output
+        if result['success']:
+            original_topic = result.get('original_topic', topic)
+            corrected_topic = result.get('corrected_topic', topic)
+            
+            spelling_info = ""
+            if original_topic.lower() != corrected_topic.lower():
+                spelling_info = f"\n🔤 Spelling corrected: '{original_topic}' → '{corrected_topic}'"
+            
+            output = [
+                "=" * 70,
+                "🎯 ACCURATE TEXTBOOK SUMMARY",
+                "=" * 70,
+                f"🔍 Your Query: '{original_topic}'",
+                f"🎯 Searching: '{corrected_topic}'{spelling_info}",
+                f"📖 Pages: {result['pages_used']} (Focused Range)",
+                f"⚡ Method: {result['method']}",
+                f"🎯 Confidence: {result.get('confidence', 'medium')}",
+                f"📄 Content: {result.get('content_length', 0)} characters",
+                "=" * 70,
+                "",
+                result['summary'],
+                "",
+                "=" * 70,
+                "💡 Precise content targeting + Spelling correction",
+                "=" * 70
+            ]
+            summary_output = "\n".join(output)
+        else:
+            summary_output = result['summary']
+
+        # Status info
+        status_info = f"Status: {'✅ Success' if result['success'] else '❌ Not Found'}\n"
+        status_info += f"Method: {result['method']}\n"
+        status_info += f"Pages: {result['pages_used']} (Focused)\n"
+        status_info += f"Confidence: {result.get('confidence', 'N/A')}\n"
+        status_info += f"Content: {result.get('content_length', 0)} chars"
+        
+        if 'corrected_topic' in result and result['corrected_topic'] != topic.lower():
+            status_info += f"\n🔤 Spelling auto-corrected"
+
+        return summary_output, status_info
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        return error_msg, f"Error: {str(e)}"
+
+# Launch accurate interface
+accurate_iface = gr.Interface(
+    fn=accurate_handler,
+    inputs=[
+        gr.File(label="📚 Upload Textbook PDF", file_types=[".pdf"]),
+        gr.Textbox(
+            label="🎯 Enter Topic (Spelling OK!)",
+            value="variales",
+            placeholder="e.g., variales, functons, tiples, objects, lists..."
+        )
+    ],
+    outputs=[
+        gr.Textbox(label="🎯 Accurate Summary", lines=20),
+        gr.Textbox(label="🔧 Search Analytics", lines=6)
+    ],
+    title="🎯 ACCURATE Textbook Summarizer - Precise Content + Spelling Correction",
+    description="Finds ACTUAL chapter content, not random mentions!",
+    allow_flagging="never"
+)
+
+print("🚀 Launching ACCURATE Textbook Summarizer...")
+print("📁 Upload your textbook PDF")
+print("🎯 Now finds actual chapter content, not random mentions!")
+print("✅ Precise targeting for variables, objects, lists, etc.")
+print("🔤 Spelling correction: variales→variables, functons→functions")
+
+# Launch the interface
+accurate_iface.launch(share=True)
