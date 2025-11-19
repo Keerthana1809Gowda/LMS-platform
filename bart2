@@ -1,0 +1,371 @@
+# Install dependencies
+!pip install -q pymupdf gradio transformers torch sentencepiece
+
+import fitz
+import re
+import textwrap
+import torch
+import gradio as gr
+from transformers import pipeline, T5ForConditionalGeneration, T5Tokenizer
+
+class PreciseTextbookSummarizer:
+    def __init__(self):
+        self.device = 0 if torch.cuda.is_available() else -1
+        
+        # Load BART model
+        try:
+            self.bart_summarizer = pipeline(
+                "summarization",
+                model="facebook/bart-large-cnn",
+                device=self.device
+            )
+            self.bart_loaded = True
+            print("✅ BART model loaded successfully")
+        except Exception as e:
+            self.bart_loaded = False
+            print(f"❌ BART loading failed: {e}")
+
+    def find_precise_content(self, pdf_path: str, topic: str) -> dict:
+        """Find PRECISE content about the specific topic"""
+        try:
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            topic_lower = topic.lower()
+
+            print(f"📖 Analyzing PDF with {total_pages} pages...")
+            print(f"🔍 PRECISE search for: '{topic}'")
+
+            # Strategy 1: Look for chapter/section headers
+            chapter_page = self._find_chapter_header(doc, topic_lower, total_pages)
+            
+            if chapter_page:
+                print(f"✅ Found chapter header at page {chapter_page}")
+                # Extract only 2-3 pages from the chapter start
+                content = self._extract_focused_content(doc, chapter_page, 3)
+                doc.close()
+                
+                if self._is_relevant_content(content, topic_lower):
+                    return {
+                        'success': True,
+                        'content': content,
+                        'pages_used': f"{chapter_page}-{chapter_page + 2}",
+                        'method': 'chapter_header',
+                        'content_length': len(content),
+                        'relevance_score': self._calculate_relevance(content, topic_lower)
+                    }
+
+            # Strategy 2: Smart content search with relevance filtering
+            content_result = self._smart_content_search(doc, topic_lower)
+            doc.close()
+            
+            return content_result
+
+        except Exception as e:
+            return {
+                'success': False,
+                'content': "",
+                'pages_used': 'Error',
+                'method': f'error: {str(e)}',
+                'content_length': 0,
+                'relevance_score': 0
+            }
+
+    def _find_chapter_header(self, doc, topic: str, total_pages: int) -> int:
+        """Find exact chapter/section headers"""
+        for page_num in range(min(50, total_pages)):
+            text = doc[page_num].get_text()
+            lines = text.split('\n')
+            
+            # Check first 10 lines for headers
+            for i, line in enumerate(lines[:10]):
+                line_clean = line.strip()
+                line_lower = line_clean.lower()
+                
+                # Look for chapter/section patterns
+                header_patterns = [
+                    rf'^\d+\.?\s+{topic}\b',  # "3. Functions" or "3 Functions"
+                    rf'^{topic}\b.*\d+',      # "Functions 3" or "Functions: 3"
+                    rf'^chapter\s+\d+.*{topic}', # "Chapter 3: Functions"
+                    rf'^{topic}\s*$',         # Just "Functions" as header
+                ]
+                
+                for pattern in header_patterns:
+                    if re.search(pattern, line_lower, re.IGNORECASE):
+                        # Verify it's a real header (not too long, not in middle of text)
+                        if (len(line_clean) < 80 and 
+                            i < 8 and  # Should be near top of page
+                            not any(exclude in line_lower for exclude in ['exercise', 'example', 'problem'])):
+                            print(f"🎯 Found header: '{line_clean}' on page {page_num + 1}")
+                            return page_num + 1
+        
+        return None
+
+    def _smart_content_search(self, doc, topic: str) -> dict:
+        """Smart content search with relevance filtering"""
+        best_content = ""
+        best_pages = []
+        best_relevance = 0
+        
+        print(f"🔍 Performing SMART search for '{topic}'...")
+        
+        for page_num in range(len(doc)):
+            text = doc[page_num].get_text()
+            if not text:
+                continue
+            
+            # Calculate relevance score for this page
+            relevance = self._calculate_page_relevance(text, topic)
+            
+            # Only consider pages with good relevance
+            if relevance >= 3:  # Minimum relevance threshold
+                clean_content = self._clean_and_filter_content(text, topic)
+                
+                if clean_content and len(clean_content) > 100:
+                    if relevance > best_relevance:
+                        best_content = clean_content
+                        best_pages = [page_num + 1]
+                        best_relevance = relevance
+                        print(f"✅ High relevance page {page_num + 1} (score: {relevance})")
+                    elif relevance == best_relevance and len(best_pages) < 3:
+                        best_content += f"\n\n--- Page {page_num + 1} ---\n{clean_content}"
+                        best_pages.append(page_num + 1)
+            
+            # Stop if we have enough high-quality content
+            if len(best_pages) >= 3 and best_relevance >= 5:
+                break
+        
+        if best_content and best_relevance >= 3:
+            pages_str = f"{best_pages[0]}" if len(best_pages) == 1 else f"{best_pages[0]}-{best_pages[-1]}"
+            
+            return {
+                'success': True,
+                'content': best_content,
+                'pages_used': pages_str,
+                'method': 'smart_search',
+                'content_length': len(best_content),
+                'relevance_score': best_relevance
+            }
+        else:
+            return {
+                'success': False,
+                'content': f"❌ No highly relevant content found about '{topic}'.\nThe topic might be called differently in this textbook.",
+                'pages_used': 'None',
+                'method': 'not_found',
+                'content_length': 0,
+                'relevance_score': 0
+            }
+
+    def _calculate_page_relevance(self, text: str, topic: str) -> int:
+        """Calculate how relevant a page is to the topic"""
+        text_lower = text.lower()
+        topic_lower = topic.lower()
+        score = 0
+        
+        # Base score for topic mention
+        if topic_lower in text_lower:
+            score += 2
+            
+            # Bonus for multiple mentions
+            mentions = text_lower.count(topic_lower)
+            score += min(mentions, 3)
+            
+            # Check if topic appears in headers (first 10 lines)
+            lines = text.split('\n')
+            for i, line in enumerate(lines[:10]):
+                line_clean = line.strip().lower()
+                if topic_lower in line_clean and len(line_clean) < 100:
+                    score += 3  # Header bonus
+                    break
+        
+        # Programming-specific relevance for "functions"
+        if topic_lower == "functions":
+            if 'def ' in text_lower:
+                score += 5  # Major bonus for function definitions
+            if 'function' in text_lower and 'def ' in text_lower:
+                score += 3  # Bonus for both terms
+            if 'parameter' in text_lower or 'argument' in text_lower or 'return' in text_lower:
+                score += 2  # Bonus for function-related terms
+        
+        # Penalty for irrelevant sections
+        if any(irrelevant in text_lower for irrelevant in ['exercise', 'problem', 'question', 'homework']):
+            score -= 2
+        
+        return max(0, score)
+
+    def _clean_and_filter_content(self, text: str, topic: str) -> str:
+        """Clean content and filter for relevance"""
+        lines = text.split('\n')
+        clean_lines = []
+        topic_found = False
+        
+        for line in lines:
+            line_clean = line.strip()
+            
+            # Skip non-educational content
+            if (len(line_clean) < 20 or
+                line_clean.isdigit() or
+                re.match(r'^page\s+\d+', line_clean.lower()) or
+                'copyright' in line_clean.lower() or
+                'contents' in line_clean.lower() or
+                re.match(r'^[A-Z\s]{15,}$', line_clean)):
+                continue
+            
+            # Check if this line is relevant to our topic
+            if topic.lower() in line_clean.lower():
+                topic_found = True
+                clean_lines.append("🎯 " + line_clean)  # Mark relevant lines
+            elif topic_found or len(clean_lines) > 0:
+                # Keep context around relevant content
+                clean_lines.append(line_clean)
+            
+            # Limit context to avoid going too far from topic
+            if len(clean_lines) > 15 and not topic_found:
+                clean_lines = []  # Reset if we haven't found topic yet
+        
+        # Only return content if we found the topic
+        if topic_found and clean_lines:
+            return ' '.join(clean_lines)
+        else:
+            return ""
+
+    def _extract_focused_content(self, doc, start_page: int, num_pages: int) -> str:
+        """Extract focused content from specific pages"""
+        content_parts = []
+        
+        for page_num in range(start_page - 1, min(start_page + num_pages - 1, len(doc))):
+            text = doc[page_num].get_text()
+            if text:
+                # Extract only the main content (skip exercises, examples, etc.)
+                lines = text.split('\n')
+                main_content = []
+                
+                for line in lines:
+                    line_clean = line.strip()
+                    if (len(line_clean) > 25 and
+                        not any(skip in line_clean.lower() for skip in ['exercise', 'example', 'problem', 'solution']) and
+                        not re.match(r'^\d+\.\s*[A-Z]', line_clean)):  # Skip numbered exercises
+                        main_content.append(line_clean)
+                
+                if main_content:
+                    content_parts.append(' '.join(main_content[:20]))  # Limit to first 20 lines
+        
+        return "\n\n".join(content_parts)
+
+    def _is_relevant_content(self, content: str, topic: str) -> bool:
+        """Check if content is actually relevant to the topic"""
+        if len(content) < 100:
+            return False
+        
+        content_lower = content.lower()
+        topic_lower = topic.lower()
+        
+        # For "functions", look for programming context
+        if topic_lower == "functions":
+            return ('def ' in content_lower or 
+                    'function' in content_lower and ('parameter' in content_lower or 'return' in content_lower))
+        
+        # For other topics, basic relevance check
+        return topic_lower in content_lower
+
+    def summarize_with_bart(self, content: str) -> str:
+        """Summarize using BART with better prompting"""
+        if not self.bart_loaded or len(content) < 200:
+            return "Not enough relevant content for summarization."
+        
+        try:
+            # Add context to help BART understand it's textbook content
+            if len(content) > 1200:
+                content = content[:1200] + "..."
+            
+            summary = self.bart_summarizer(
+                content,
+                max_length=250,
+                min_length=120,
+                do_sample=False
+            )[0]['summary_text']
+            
+            return summary
+            
+        except Exception as e:
+            # Fallback: extract key sentences
+            sentences = [s.strip() for s in content.split('.') if len(s.strip()) > 40]
+            key_sentences = [s for s in sentences if any(keyword in s.lower() for keyword in ['function', 'def ', 'parameter', 'return'])]
+            return '. '.join(key_sentences[:4]) + '.' if key_sentences else content[:400] + "..."
+
+# Initialize the precise summarizer
+summarizer = PreciseTextbookSummarizer()
+
+def precise_handler(uploaded_file, topic):
+    """Handler for precise content extraction"""
+    if uploaded_file is None:
+        return "❌ Please upload a PDF file", "Waiting for file..."
+    
+    try:
+        pdf_path = uploaded_file.name
+
+        # Find precise content
+        content_result = summarizer.find_precise_content(pdf_path, topic)
+        
+        if not content_result['success']:
+            return content_result['content'], "❌ No relevant content found"
+
+        # Generate summary
+        summary = summarizer.summarize_with_bart(content_result['content'])
+        
+        # Format output
+        output = f"""
+📚 PRECISE TEXTBOOK SUMMARY
+{'=' * 70}
+Topic: {topic.title()}
+Pages: {content_result['pages_used']}
+Method: {content_result['method']}
+Relevance Score: {content_result['relevance_score']}/10
+Content Length: {content_result['content_length']} characters
+{'=' * 70}
+
+{summary}
+
+{'=' * 70}
+✅ Extracted from highly relevant pages only
+{'=' * 70}
+"""
+
+        # Status info
+        status_info = f"✅ PRECISE MATCH\n"
+        status_info += f"📖 Pages: {content_result['pages_used']}\n"
+        status_info += f"🎯 Relevance: {content_result['relevance_score']}/10\n"
+        status_info += f"📄 Content: {content_result['content_length']} chars\n"
+        status_info += f"⚡ Method: {content_result['method']}"
+
+        return output, status_info
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        return error_msg, f"Error: {str(e)}"
+
+# Create precise interface
+precise_iface = gr.Interface(
+    fn=precise_handler,
+    inputs=[
+        gr.File(label="📚 Upload Textbook PDF", file_types=[".pdf"]),
+        gr.Textbox(
+            label="🎯 Enter Exact Topic",
+            value="functions",
+            placeholder="e.g., functions, loops, lists, classes"
+        )
+    ],
+    outputs=[
+        gr.Textbox(label="📝 Precise Summary", lines=20),
+        gr.Textbox(label="🔧 Accuracy Status", lines=5)
+    ],
+    title="🎯 PRECISE Textbook Summarizer - No More Random Content!",
+    description="Uses SMART relevance filtering to find EXACT content about your topic, not random pages!",
+    allow_flagging="never"
+)
+
+print("🚀 Launching PRECISE Textbook Summarizer...")
+print("📁 Upload your textbook PDF")
+print("🎯 This version finds EXACT content, not random pages!")
+print("✅ Smart relevance scoring prevents variable content when searching for functions!")
+
+precise_iface.launch(share=True)
