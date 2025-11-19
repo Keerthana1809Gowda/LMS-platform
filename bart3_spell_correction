@@ -1,0 +1,392 @@
+# Install dependencies
+!pip install -q pymupdf gradio transformers torch
+
+import fitz
+import re
+import textwrap
+import torch
+import gradio as gr
+from transformers import pipeline
+from difflib import SequenceMatcher
+
+class BalancedTextbookSummarizer:
+    def __init__(self):
+        self.device = 0 if torch.cuda.is_available() else -1
+        self.summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=self.device
+        )
+        
+        # Programming topics with their key indicators
+        self.topic_indicators = {
+            'functions': ['def ', 'function', 'parameter', 'argument', 'return', 'call', 'define'],
+            'variables': ['variable', 'assignment', '=', 'declare', 'name', 'value', 'store'],
+            'tuples': ['tuple', 'immutable', 'parentheses', '()', 'cannot change', 'unchangeable'],
+            'lists': ['list', '[]', 'append', 'pop', 'mutable', 'sequence', 'element'],
+            'loops': ['for', 'while', 'loop', 'iteration', 'range', 'break', 'continue'],
+            'classes': ['class', 'object', 'self', 'method', 'attribute', 'instance'],
+            'dictionaries': ['dictionary', 'dict', '{}', 'key', 'value', 'key-value'],
+        }
+        
+        # Common misspellings
+        self.common_misspellings = {
+            'functons': 'functions', 'functios': 'functions', 'funtions': 'functions',
+            'tiples': 'tuples', 'tupes': 'tuples', 'tupples': 'tuples',
+            'variales': 'variables', 'varibles': 'variables', 'variabels': 'variables',
+            'lopos': 'loops', 'lops': 'loops', 'loops': 'loops',
+            'clases': 'classes', 'clasess': 'classes', 'classess': 'classes',
+            'dictonaries': 'dictionaries', 'dictionaris': 'dictionaries'
+        }
+        print("✅ BART model loaded successfully")
+
+    def correct_spelling(self, user_topic: str) -> str:
+        """Correct spelling mistakes"""
+        user_topic_lower = user_topic.lower().strip()
+        
+        # Direct match
+        if user_topic_lower in self.topic_indicators:
+            return user_topic_lower
+        
+        # Common misspellings
+        if user_topic_lower in self.common_misspellings:
+            corrected = self.common_misspellings[user_topic_lower]
+            print(f"🔤 Spelling corrected: '{user_topic}' -> '{corrected}'")
+            return corrected
+        
+        # Fuzzy matching
+        best_match = None
+        best_score = 0
+        
+        for correct_topic in self.topic_indicators.keys():
+            similarity = SequenceMatcher(None, user_topic_lower, correct_topic).ratio()
+            if similarity > best_score:
+                best_score = similarity
+                best_match = correct_topic
+        
+        if best_score > 0.5:  # Lower threshold
+            print(f"🔤 Fuzzy match: '{user_topic}' -> '{best_match}' (score: {best_score:.2f})")
+            return best_match
+        
+        return user_topic_lower
+
+    def summarize_topic(self, pdf_path: str, user_topic: str) -> dict:
+        """Balanced textbook summarization"""
+        try:
+            # Correct spelling
+            corrected_topic = self.correct_spelling(user_topic)
+            
+            print(f"🔍 Searching for: '{corrected_topic}' (from '{user_topic}')")
+            
+            doc = fitz.open(pdf_path)
+            
+            # Strategy 1: Find chapter/section
+            chapter_content = self._find_chapter_content(doc, corrected_topic)
+            if chapter_content:
+                doc.close()
+                return chapter_content
+            
+            # Strategy 2: Smart content extraction
+            content_result = self._extract_smart_content(doc, corrected_topic)
+            doc.close()
+            
+            return content_result
+
+        except Exception as e:
+            return {
+                'success': False,
+                'summary': f"❌ Error: {str(e)}",
+                'pages_used': 'Error',
+                'method': 'error'
+            }
+
+    def _find_chapter_content(self, doc, topic: str) -> dict:
+        """Find content from chapter/section headers"""
+        # Look for chapter patterns in first 30 pages
+        for page_num in range(min(30, len(doc))):
+            text = doc[page_num].get_text()
+            lines = text.split('\n')
+            
+            for i, line in enumerate(lines[:15]):  # Check first 15 lines
+                line_clean = line.strip()
+                if self._is_chapter_header(line_clean, topic):
+                    print(f"🎯 Found chapter header: '{line_clean}' on page {page_num + 1}")
+                    
+                    # Extract content from this chapter
+                    content = self._extract_chapter_content(doc, page_num + 1, topic)
+                    if content and len(content) > 400:
+                        summary = self._summarize_content(content)
+                        return {
+                            'success': True,
+                            'summary': summary,
+                            'pages_used': f"{page_num + 1}",
+                            'method': 'chapter_based',
+                            'confidence': 'high',
+                            'content_length': len(content)
+                        }
+        
+        return None
+
+    def _is_chapter_header(self, line: str, topic: str) -> bool:
+        """Check if line is a chapter/section header about the topic"""
+        # Common header patterns
+        patterns = [
+            rf'^\d+\.?\s+{topic}\b',
+            rf'^{topic}\b.*\d+',
+            rf'^[A-Z\s]+\b{topic}\b',
+            rf'^{topic}\s*$'
+        ]
+        
+        line_lower = line.lower()
+        topic_lower = topic.lower()
+        
+        # Check patterns
+        for pattern in patterns:
+            if re.search(pattern, line_lower, re.IGNORECASE):
+                return True
+        
+        # Check if it's a short line containing the topic (likely header)
+        if (topic_lower in line_lower and 
+            len(line) < 100 and 
+            len(line) > len(topic) and
+            not any(exclude in line_lower for exclude in ['exercise', 'example', 'problem'])):
+            return True
+        
+        return False
+
+    def _extract_smart_content(self, doc, topic: str) -> dict:
+        """Extract content using smart filtering"""
+        content_parts = []
+        relevant_pages = []
+        
+        print(f"🔍 Smart search for '{topic}'...")
+        
+        for page_num in range(len(doc)):
+            text = doc[page_num].get_text()
+            if not text:
+                continue
+            
+            # Check if this page is relevant to our topic
+            relevance_score = self._calculate_relevance(text, topic)
+            
+            if relevance_score >= 3:  # Lower threshold to catch more content
+                # Extract topic-specific content
+                topic_content = self._extract_topic_content(text, topic)
+                if topic_content and len(topic_content) > 100:
+                    content_parts.append(f"📖 Page {page_num + 1}:\n{topic_content}")
+                    relevant_pages.append(page_num + 1)
+                    print(f"✅ Relevant page {page_num + 1} (score: {relevance_score})")
+                    
+                    # Stop when we have enough good content
+                    if len(relevant_pages) >= 4:
+                        break
+        
+        if content_parts and len(content_parts) > 0:
+            full_content = "\n\n".join(content_parts)
+            summary = self._summarize_content(full_content)
+            pages_str = f"{relevant_pages[0]}-{relevant_pages[-1]}" if len(relevant_pages) > 1 else str(relevant_pages[0])
+            
+            return {
+                'success': True,
+                'summary': summary,
+                'pages_used': pages_str,
+                'method': 'smart_search',
+                'confidence': 'medium',
+                'content_length': len(full_content)
+            }
+        else:
+            return {
+                'success': False,
+                'summary': f"❌ No content found about '{topic}'.\n\nTry: {', '.join(self.topic_indicators.keys())}",
+                'pages_used': 'None',
+                'method': 'not_found'
+            }
+
+    def _calculate_relevance(self, text: str, topic: str) -> int:
+        """Calculate relevance score with balanced approach"""
+        text_lower = text.lower()
+        score = 0
+        
+        # Base topic presence
+        if topic in text_lower:
+            score += 3
+            
+            # Multiple mentions
+            mentions = text_lower.count(topic)
+            score += min(mentions, 3)
+        
+        # Topic-specific indicators
+        if topic in self.topic_indicators:
+            for indicator in self.topic_indicators[topic]:
+                if indicator in text_lower:
+                    score += 2
+        
+        # Educational context bonus
+        if any(keyword in text_lower for keyword in ['define', 'explain', 'introduction', 'overview']):
+            score += 2
+        
+        # Code/syntax bonus
+        if any(char in text for char in ['=', '(', ')', ':', '{', '}']):
+            score += 1
+        
+        # Header bonus
+        lines = text.split('\n')
+        for i, line in enumerate(lines[:10]):
+            if topic in line.lower() and len(line.strip()) < 100:
+                score += 3
+                break
+        
+        return score
+
+    def _extract_topic_content(self, text: str, topic: str) -> str:
+        """Extract content specifically about the topic"""
+        lines = text.split('\n')
+        relevant_lines = []
+        in_topic_section = False
+        
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 10:
+                continue
+            
+            line_lower = line_clean.lower()
+            
+            # Check if this line starts a topic section
+            if (topic in line_lower and 
+                len(line_clean) < 150 and
+                not any(exclude in line_lower for exclude in ['exercise', 'problem', 'question'])):
+                in_topic_section = True
+            
+            # Collect lines when in topic section
+            if in_topic_section:
+                # Stop if we hit a new section
+                if (len(line_clean) < 100 and 
+                    any(section in line_lower for section in ['exercise', 'example', 'summary', 'next']) and
+                    topic not in line_lower):
+                    break
+                
+                relevant_lines.append(line_clean)
+            
+            # Also collect lines that directly mention the topic
+            elif topic in line_lower and len(line_clean) > 20:
+                relevant_lines.append(line_clean)
+        
+        return ' '.join(relevant_lines[:25])  # Reasonable limit
+
+    def _extract_chapter_content(self, doc, start_page: int, topic: str) -> str:
+        """Extract content from a chapter"""
+        content_parts = []
+        
+        # Extract 5 pages from the chapter start
+        for page_num in range(start_page - 1, min(start_page + 4, len(doc))):
+            text = doc[page_num].get_text()
+            if text:
+                # Extract topic-specific content from this page
+                topic_content = self._extract_topic_content(text, topic)
+                if topic_content:
+                    content_parts.append(topic_content)
+        
+        return "\n\n".join(content_parts)
+
+    def _summarize_content(self, content: str) -> str:
+        """Summarize content using BART"""
+        if len(content) < 300:
+            return "Content found but too short for meaningful summary."
+        
+        try:
+            if len(content) > 1200:
+                content = content[:1200] + "..."
+            
+            summary = self.summarizer(
+                content,
+                max_length=300,
+                min_length=150,
+                do_sample=False
+            )[0]['summary_text']
+            return summary
+        except Exception as e:
+            # Fallback: extract key sentences
+            sentences = [s.strip() for s in content.split('.') if len(s.strip()) > 30]
+            return '. '.join(sentences[:4]) + '.' if sentences else content[:500] + "..."
+
+# Initialize the balanced summarizer
+summarizer = BalancedTextbookSummarizer()
+
+def balanced_handler(uploaded_file, user_topic):
+    """Handler with balanced approach"""
+    if uploaded_file is None:
+        return "❌ Please upload a PDF file", "Waiting for file..."
+
+    try:
+        pdf_path = uploaded_file.name
+
+        result = summarizer.summarize_topic(pdf_path, user_topic)
+
+        # Create output
+        if result['success']:
+            output = [
+                "=" * 70,
+                "🎯 SMART TEXTBOOK SUMMARY",
+                "=" * 70,
+                f"🔍 Your Query: '{user_topic}'",
+                f"📖 Pages: {result['pages_used']}",
+                f"⚡ Method: {result['method']}",
+                f"🎯 Confidence: {result.get('confidence', 'medium').title()}",
+                f"📄 Content: {result.get('content_length', 0)} characters",
+                "=" * 70,
+                "",
+                result['summary'],
+                "",
+                "=" * 70,
+                "✅ Balanced approach - finds actual content!",
+                "=" * 70
+            ]
+            summary_output = "\n".join(output)
+            
+            status_info = f"✅ SUCCESS: Found '{summarizer.correct_spelling(user_topic)}'\n"
+            status_info += f"📖 Pages: {result['pages_used']}\n"
+            status_info += f"🎯 Confidence: {result.get('confidence', 'medium').title()}\n"
+            status_info += f"📄 Content: {result.get('content_length', 0)} chars"
+            
+            # Show spelling correction if applicable
+            corrected = summarizer.correct_spelling(user_topic)
+            if corrected != user_topic.lower():
+                status_info += f"\n🔤 Corrected: '{user_topic}' → '{corrected}'"
+
+        else:
+            summary_output = result['summary']
+            status_info = "❌ Topic not found"
+
+        return summary_output, status_info
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        return error_msg, f"Error: {str(e)}"
+
+# Launch balanced interface
+balanced_iface = gr.Interface(
+    fn=balanced_handler,
+    inputs=[
+        gr.File(label="📚 Upload Textbook PDF", file_types=[".pdf"]),
+        gr.Textbox(
+            label="🎯 Enter Topic (Spelling OK!)",
+            value="variales",
+            placeholder="e.g., variales, functons, tiples, lopos..."
+        )
+    ],
+    outputs=[
+        gr.Textbox(label="🎯 Smart Summary", lines=20),
+        gr.Textbox(label="🔧 Search Info", lines=5)
+    ],
+    title="🎯 SMART Textbook Summarizer - Balanced & Accurate",
+    description="Works with spelling mistakes and finds ACTUAL textbook content!",
+    allow_flagging="never"
+)
+
+print("🚀 Launching SMART Textbook Summarizer...")
+print("📁 Upload your textbook PDF")
+print("🎯 Test with: variales, functons, tiples, lopos")
+print("✅ Balanced approach - finds real content!")
+
+# Launch the interface
+balanced_iface.launch(share=True)
