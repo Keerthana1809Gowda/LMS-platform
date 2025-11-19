@@ -1,0 +1,345 @@
+# Install dependencies
+!pip install -q pymupdf gradio transformers torch
+
+import fitz
+import re
+import textwrap
+import torch
+import gradio as gr
+from transformers import pipeline
+
+class AccurateTextbookSummarizer:
+    def __init__(self):
+        self.device = 0 if torch.cuda.is_available() else -1
+        self.summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=self.device
+        )
+        print("✅ BART model loaded successfully")
+
+    def summarize_topic(self, pdf_path: str, topic: str) -> dict:
+        """Accurate textbook summarization with precise page detection"""
+        try:
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+
+            print(f"📖 Analyzing PDF with {total_pages} pages...")
+            print(f"🔍 Searching for: '{topic}'")
+
+            # STRATEGY 1: Find exact chapter using improved TOC detection
+            chapter_info = self._find_exact_chapter(doc, topic, total_pages)
+
+            if chapter_info:
+                print(f"✅ Found '{topic}' at page {chapter_info['start_page']}")
+                content = self._extract_precise_content(doc, chapter_info['start_page'])
+                doc.close()
+
+                if content and len(content) > 300:
+                    summary = self._summarize_with_bart(content)
+                    return {
+                        'success': True,
+                        'summary': summary,
+                        'pages_used': f"{chapter_info['start_page']}-{chapter_info['start_page'] + 4}",
+                        'method': 'exact_chapter',
+                        'confidence': 'high',
+                        'content_length': len(content)
+                    }
+
+            doc.close()
+            
+            # If exact chapter not found, try direct content search
+            return self._direct_content_search(pdf_path, topic)
+
+        except Exception as e:
+            return {
+                'success': False,
+                'summary': f"❌ Error: {str(e)}",
+                'pages_used': 'Error',
+                'method': 'error'
+            }
+
+    def _find_exact_chapter(self, doc, topic: str, total_pages: int) -> dict:
+        """Improved chapter finding with better pattern matching"""
+        topic_lower = topic.lower()
+        
+        # Common chapter patterns for programming textbooks
+        chapter_patterns = [
+            # Pattern: "3 Functions 45" (number, title, page)
+            (r'^(\d+)\s+([A-Za-z][A-Za-z\s]+?)\s+(\d{2,4})$'),
+            # Pattern: "Functions 45" (title, page)
+            (r'^([A-Z][a-zA-Z\s]+?)\s+(\d{2,4})$'),
+            # Pattern: "3. Functions 45" (number.dot, title, page)
+            (r'^(\d+\.)\s+([A-Za-z][A-Za-z\s]+?)\s+(\d{2,4})$'),
+            # Pattern: "Chapter 3: Functions 45" (formal chapter)
+            (r'^Chapter\s+(\d+):\s*([A-Za-z][A-Za-z\s]+?)\s+(\d{2,4})$', re.IGNORECASE),
+        ]
+
+        # Search table of contents pages (usually first 10-15 pages)
+        for page_num in range(min(15, total_pages)):
+            text = doc[page_num].get_text()
+            lines = text.split('\n')
+            
+            for line_num, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Skip very short lines or obvious non-TOC lines
+                if len(line_clean) < 5 or len(line_clean) > 150:
+                    continue
+                    
+                # Check for TOC indicators
+                if any(indicator in line_clean.lower() for indicator in ['contents', 'chapter', 'page']):
+                    # This might be a TOC page, check surrounding lines
+                    for check_line in lines[max(0, line_num-2):min(len(lines), line_num+3)]:
+                        check_clean = check_line.strip()
+                        
+                        # Try all patterns
+                        for pattern in chapter_patterns:
+                            flags = pattern[1] if len(pattern) == 2 else 0
+                            pattern_str = pattern[0] if len(pattern) == 2 else pattern
+                            
+                            match = re.match(pattern_str, check_clean, flags) if flags else re.match(pattern_str, check_clean)
+                            if match:
+                                groups = match.groups()
+                                
+                                # Extract chapter info based on pattern
+                                if len(groups) == 3:
+                                    # "3 Functions 45" pattern
+                                    chapter_num, chapter_name, page_num_str = groups
+                                    chapter_name = chapter_name.strip()
+                                elif len(groups) == 2:
+                                    # "Functions 45" pattern  
+                                    chapter_name, page_num_str = groups
+                                    chapter_name = chapter_name.strip()
+                                else:
+                                    continue
+                                
+                                # Clean chapter name
+                                chapter_name = re.sub(r'[^A-Za-z0-9\s]', '', chapter_name).strip()
+                                
+                                # Check if this matches our topic
+                                if (topic_lower == chapter_name.lower() or 
+                                    topic_lower in chapter_name.lower()):
+                                    
+                                    page_found = int(page_num_str)
+                                    print(f"🎯 Exact match: '{chapter_name}' -> Page {page_found}")
+                                    
+                                    return {
+                                        'start_page': page_found,
+                                        'chapter_name': chapter_name,
+                                        'source_line': check_clean
+                                    }
+
+        return None
+
+    def _direct_content_search(self, pdf_path: str, topic: str) -> dict:
+        """Direct content search when TOC is not available"""
+        try:
+            doc = fitz.open(pdf_path)
+            topic_lower = topic.lower()
+            best_content = ""
+            best_pages = []
+            content_found = False
+            
+            print(f"🔍 Performing direct content search for '{topic}'...")
+            
+            # Search through all pages
+            for page_num in range(len(doc)):
+                text = doc[page_num].get_text()
+                if not text:
+                    continue
+                
+                text_lower = text.lower()
+                
+                # Check if topic is mentioned on this page
+                if topic_lower in text_lower:
+                    # Check if this looks like a section header
+                    lines = text.split('\n')
+                    header_found = False
+                    
+                    for i, line in enumerate(lines[:8]):  # Check first 8 lines for headers
+                        line_clean = line.strip()
+                        if (topic_lower in line_clean.lower() and 
+                            len(line_clean) < 100 and 
+                            len(line_clean) > len(topic)):
+                            # Likely a section header
+                            header_found = True
+                            break
+                    
+                    # Extract content from this page
+                    clean_content = self._clean_content(text)
+                    if clean_content:
+                        if header_found:
+                            # If header found, this is likely the start of the section
+                            best_content = clean_content
+                            best_pages = [page_num + 1]
+                            content_found = True
+                            print(f"✅ Found section header for '{topic}' on page {page_num + 1}")
+                            break
+                        else:
+                            # Otherwise, collect content
+                            best_content += f"\n\n--- Page {page_num + 1} ---\n{clean_content}"
+                            best_pages.append(page_num + 1)
+                            content_found = True
+            
+            doc.close()
+            
+            if content_found and len(best_content) > 300:
+                summary = self._summarize_with_bart(best_content)
+                pages_str = f"{best_pages[0]}-{best_pages[-1]}" if len(best_pages) > 1 else f"{best_pages[0]}"
+                
+                return {
+                    'success': True,
+                    'summary': summary,
+                    'pages_used': pages_str,
+                    'method': 'content_search',
+                    'confidence': 'medium',
+                    'content_length': len(best_content)
+                }
+            else:
+                return {
+                    'success': False,
+                    'summary': f"❌ No substantial content found about '{topic}'.\n\nTry searching for: functions, variables, loops, classes, lists",
+                    'pages_used': 'None',
+                    'method': 'not_found'
+                }
+                
+        except Exception as e:
+            return {
+                'success': False,
+                'summary': f"❌ Search error: {str(e)}",
+                'pages_used': 'Error',
+                'method': 'error'
+            }
+
+    def _extract_precise_content(self, doc, start_page: int, num_pages: int = 5) -> str:
+        """Extract content from precise page range"""
+        content_parts = []
+        
+        for page_num in range(start_page - 1, min(start_page + num_pages - 1, len(doc))):
+            text = doc[page_num].get_text()
+            if text:
+                clean_text = self._clean_content(text)
+                if clean_text and len(clean_text) > 100:  # Only add substantial content
+                    content_parts.append(clean_text)
+        
+        return "\n\n".join(content_parts)
+
+    def _clean_content(self, text: str) -> str:
+        """Clean content while preserving educational material"""
+        lines = text.split('\n')
+        clean_lines = []
+        
+        for line in lines:
+            line_clean = line.strip()
+            # Keep substantial educational content
+            if (len(line_clean) > 25 and 
+                not line_clean.isdigit() and
+                not re.match(r'^page\s+\d+', line_clean.lower()) and
+                not re.match(r'^chapter\s+\d+', line_clean.lower()) and
+                'copyright' not in line_clean.lower() and
+                'contents' not in line_clean.lower() and
+                not re.match(r'^[A-Z\s]{20,}$', line_clean) and
+                'exercise' not in line_clean.lower()):
+                clean_lines.append(line_clean)
+        
+        return ' '.join(clean_lines)
+
+    def _summarize_with_bart(self, content: str) -> str:
+        """Summarize content using BART with better handling"""
+        if len(content) < 300:
+            return "Not enough substantial content for meaningful summarization."
+        
+        try:
+            # Limit content length but preserve important information
+            if len(content) > 1500:
+                # Keep beginning and some context
+                content = content[:1200] + "... [additional content truncated]"
+            
+            summary = self.summarizer(
+                content,
+                max_length=300,
+                min_length=150,
+                do_sample=False
+            )
+            return summary[0]['summary_text']
+        except Exception as e:
+            print(f"BART summarization warning: {e}")
+            # Fallback: return meaningful excerpt
+            sentences = [s.strip() for s in content.split('.') if len(s.strip()) > 40]
+            return '. '.join(sentences[:4]) + '.' if sentences else content[:400] + "..."
+
+def accurate_handler(uploaded_file, topic):
+    """Accurate handler with better feedback"""
+    if uploaded_file is None:
+        return "❌ Please upload a PDF file", "Waiting for file..."
+
+    try:
+        pdf_path = uploaded_file.name
+
+        summarizer = AccurateTextbookSummarizer()
+        result = summarizer.summarize_topic(pdf_path, topic)
+
+        # Create output
+        if result['success']:
+            output = [
+                "=" * 70,
+                "📚 ACCURATE TEXTBOOK SUMMARY",
+                "=" * 70,
+                f"🔍 Topic: {topic.title()}",
+                f"📖 Pages: {result['pages_used']}",
+                f"⚡ Method: {result['method']}",
+                f"🎯 Confidence: {result.get('confidence', 'medium')}",
+                f"📄 Content: {result.get('content_length', 0)} characters",
+                "=" * 70,
+                "",
+                result['summary'],
+                "",
+                "=" * 70,
+                "💡 Generated using Accurate BART Summarizer",
+                "=" * 70
+            ]
+            summary_output = "\n".join(output)
+        else:
+            summary_output = result['summary']
+
+        # Status info
+        status_info = f"Status: {'✅ Success' if result['success'] else '❌ Not Found'}\n"
+        status_info += f"Method: {result['method']}\n"
+        status_info += f"Pages: {result['pages_used']}\n"
+        status_info += f"Confidence: {result.get('confidence', 'N/A')}\n"
+        status_info += f"Content Length: {result.get('content_length', 0)} chars"
+
+        return summary_output, status_info
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        return error_msg, f"Error: {str(e)}"
+
+# Launch accurate interface
+accurate_iface = gr.Interface(
+    fn=accurate_handler,
+    inputs=[
+        gr.File(label="📚 Upload Textbook PDF", file_types=[".pdf"]),
+        gr.Textbox(
+            label="🎯 Enter Topic to Search",
+            value="functions",
+            placeholder="e.g., functions, loops, lists, classes, variables..."
+        )
+    ],
+    outputs=[
+        gr.Textbox(label="📝 Accurate Summary", lines=20),
+        gr.Textbox(label="🔧 Detailed Status", lines=6)
+    ],
+    title="🎯 ACCURATE Textbook Summarizer - Precise Page Detection",
+    description="Upload your textbook PDF and enter a topic. Uses improved algorithms for precise page detection.",
+    allow_flagging="never"
+)
+
+print("🚀 Launching ACCURATE Textbook Summarizer...")
+print("📁 Upload your textbook PDF")
+print("🎯 Now with precise page detection and better content extraction!")
+print("✅ Using improved BART summarization")
+
+# Launch the interface
+accurate_iface.launch(share=True)
