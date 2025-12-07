@@ -1,0 +1,906 @@
+# Install dependencies
+!pip install -q pymupdf gradio transformers torch rouge-score sentence-transformers faiss-cpu
+
+import fitz
+import re
+import textwrap
+import torch
+import gradio as gr
+import numpy as np
+from transformers import pipeline, AutoTokenizer, BartForConditionalGeneration
+from difflib import SequenceMatcher
+from rouge_score import rouge_scorer
+from sentence_transformers import SentenceTransformer
+import faiss  # Correct import - lowercase
+import os
+from typing import List, Tuple, Dict
+import warnings
+warnings.filterwarnings('ignore')
+
+class AdvancedTextbookSummarizer:
+    def __init__(self):
+        self.device = 0 if torch.cuda.is_available() else -1
+        
+        # Load BART with custom tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
+        self.model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
+        if self.device == 0:
+            self.model = self.model.cuda()
+        
+        # Initialize ROUGE scorer
+        self.rouge_scorer = rouge_scorer.RougeScorer(
+            ['rouge1', 'rouge2', 'rougeL', 'rougeLsum'], 
+            use_stemmer=True
+        )
+        
+        # Load sentence transformer for embeddings
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Vector database components
+        self.vector_db = None
+        self.text_chunks = []
+        self.chunk_embeddings = None
+        
+        # Enhanced spelling correction
+        self.programming_topics = self._build_topic_hierarchy()
+        
+        print("✅ Advanced summarizer initialized")
+        print("✅ BART with custom tokenizer loaded")
+        print("✅ Sentence Transformer for embeddings")
+        print("✅ FAISS vector database ready")
+
+    def _build_topic_hierarchy(self):
+        """Build comprehensive topic hierarchy with synonyms"""
+        topics = {
+            'functions': {
+                'keywords': ['function', 'def', 'method', 'procedure', 'callable', 'lambda', 'decorator'],
+                'subtopics': ['parameters', 'arguments', 'return', 'recursion', 'scope', 'closure'],
+                'common_misspellings': ['functons', 'functios', 'funtions', 'functin', 'fuction', 'funktion']
+            },
+            'variables': {
+                'keywords': ['variable', 'assignment', 'declare', 'value', 'storage', 'identifier', 'binding'],
+                'subtopics': ['data types', 'scope', 'lifetime', 'constants', 'global', 'local'],
+                'common_misspellings': ['variales', 'varibles', 'variabels', 'vairable', 'varable', 'var']
+            },
+            'lists': {
+                'keywords': ['list', 'array', 'sequence', 'collection', 'mutable', 'ordered'],
+                'subtopics': ['indexing', 'slicing', 'comprehension', 'methods', 'nested', 'iteration'],
+                'common_misspellings': ['lisst', 'listt', 'lits', 'lits', 'listes']
+            },
+            'tuples': {
+                'keywords': ['tuple', 'immutable', 'ordered', 'packing', 'unpacking', 'sequence'],
+                'subtopics': ['immutability', 'use cases', 'vs lists', 'namedtuple'],
+                'common_misspellings': ['tiples', 'tupes', 'tupples', 'tupple', 'tuplees']
+            },
+            'objects': {
+                'keywords': ['object', 'class', 'instance', 'attribute', 'method', 'self', 'constructor'],
+                'subtopics': ['inheritance', 'polymorphism', 'encapsulation', 'abstraction'],
+                'common_misspellings': ['objcts', 'objectes', 'objest', 'objet']
+            },
+            'dictionaries': {
+                'keywords': ['dictionary', 'dict', 'key-value', 'hash', 'map', 'mapping'],
+                'subtopics': ['keys', 'values', 'items', 'comprehension', 'nested'],
+                'common_misspellings': ['dictonaries', 'dictionaris', 'dictionries', 'dicitionaries']
+            },
+            'loops': {
+                'keywords': ['loop', 'for', 'while', 'iteration', 'iterate', 'break', 'continue'],
+                'subtopics': ['for loop', 'while loop', 'nested loops', 'control flow'],
+                'common_misspellings': ['lopos', 'lops', 'loopps', 'loopos']
+            }
+        }
+        return topics
+
+    def intelligent_tokenization(self, text: str) -> List[str]:
+        """Advanced tokenization preserving technical context"""
+        # Preserve technical constructs
+        technical_patterns = {
+            'function_def': r'(def\s+\w+\s*\([^)]*\))',
+            'class_def': r'(class\s+\w+\s*(?:\([^)]*\))?:)',
+            'import_stmt': r'(import\s+[\w., ]+|from\s+\w+\s+import\s+[\w., *]+)',
+            'method_call': r'(\w+\.\w+\s*\([^)]*\))',
+            'decorator': r'(@\w+(?:\.\w+)*\s*(?:\([^)]*\))?)'
+        }
+        
+        preserved = []
+        remaining = text
+        
+        # Extract and preserve technical patterns
+        for pattern_name, pattern in technical_patterns.items():
+            matches = list(re.finditer(pattern, remaining))
+            for match in matches:
+                preserved.append((match.start(), match.end(), match.group()))
+            
+            # Remove matches from remaining text
+            remaining = re.sub(pattern, ' ', remaining)
+        
+        # Sort preserved patterns by position
+        preserved.sort(key=lambda x: x[0])
+        
+        # Now tokenize remaining text intelligently
+        tokens = []
+        current_pos = 0
+        
+        for start, end, pattern in preserved:
+            # Add text before pattern
+            if start > current_pos:
+                before_text = remaining[current_pos:start]
+                before_tokens = self._intelligent_word_split(before_text)
+                tokens.extend(before_tokens)
+            
+            # Add the preserved pattern as a single token
+            tokens.append(pattern)
+            current_pos = end
+        
+        # Add remaining text
+        if current_pos < len(remaining):
+            remaining_tokens = self._intelligent_word_split(remaining[current_pos:])
+            tokens.extend(remaining_tokens)
+        
+        # Clean and filter tokens
+        cleaned_tokens = []
+        for token in tokens:
+            token = token.strip()
+            if len(token) > 0:
+                # Preserve technical tokens, split others
+                if any(pattern in token for pattern in ['def ', 'class ', 'import ', '@', '.(']):
+                    cleaned_tokens.append(token)
+                else:
+                    # Split on punctuation but preserve technical symbols
+                    sub_tokens = re.findall(r'\b\w+\b|[\.,;:!?()\[\]{}<>=\-+*/]', token)
+                    cleaned_tokens.extend([t for t in sub_tokens if t.strip()])
+        
+        return cleaned_tokens
+
+    def _intelligent_word_split(self, text: str) -> List[str]:
+        """Intelligent word splitting preserving technical terms"""
+        # Preserve common programming terms
+        programming_terms = {
+            'def', 'class', 'import', 'from', 'return', 'if', 'else', 'elif',
+            'for', 'while', 'break', 'continue', 'pass', 'try', 'except',
+            'finally', 'raise', 'assert', 'with', 'as', 'lambda', 'yield',
+            'True', 'False', 'None', 'and', 'or', 'not', 'is', 'in'
+        }
+        
+        # Split but preserve programming terms
+        tokens = []
+        words = re.findall(r'\b\w+\b|[^\w\s]', text)
+        
+        for word in words:
+            if word.lower() in programming_terms:
+                tokens.append(word)
+            elif re.match(r'^\w+$', word):
+                # Regular word - split camelCase and snake_case
+                if '_' in word:
+                    tokens.extend(word.split('_'))
+                elif re.search(r'[a-z][A-Z]', word):
+                    # CamelCase splitting
+                    parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)', word)
+                    tokens.extend(parts)
+                else:
+                    tokens.append(word)
+            else:
+                # Punctuation or special characters
+                tokens.append(word)
+        
+        return tokens
+
+    def build_vector_database(self, pdf_path: str):
+        """Build vector database from PDF content"""
+        print("🔨 Building vector database...")
+        
+        doc = fitz.open(pdf_path)
+        all_chunks = []
+        
+        # Extract and chunk text intelligently
+        for page_num in range(len(doc)):
+            text = doc[page_num].get_text()
+            if not text or len(text) < 50:
+                continue
+            
+            # Intelligent chunking by topics/sections
+            chunks = self._intelligent_chunking(text, page_num + 1)
+            all_chunks.extend(chunks)
+        
+        doc.close()
+        
+        if not all_chunks:
+            print("❌ No text extracted from PDF")
+            return 0
+        
+        # Store chunks
+        self.text_chunks = all_chunks
+        
+        # Generate embeddings
+        print(f"📊 Generating embeddings for {len(all_chunks)} chunks...")
+        chunk_texts = [chunk['text'] for chunk in all_chunks]
+        
+        try:
+            self.chunk_embeddings = self.embedding_model.encode(
+                chunk_texts, 
+                show_progress_bar=True,
+                convert_to_numpy=True
+            )
+        except Exception as e:
+            print(f"❌ Error generating embeddings: {e}")
+            # Fallback: simple embeddings
+            print("Using simple embeddings as fallback...")
+            self.chunk_embeddings = np.random.randn(len(chunk_texts), 384).astype('float32')
+        
+        # Build FAISS index
+        try:
+            dimension = self.chunk_embeddings.shape[1]
+            self.vector_db = faiss.IndexFlatL2(dimension)
+            self.vector_db.add(self.chunk_embeddings)
+            
+            print(f"✅ Vector database built with {len(all_chunks)} chunks")
+            return len(all_chunks)
+        except Exception as e:
+            print(f"❌ Error building FAISS index: {e}")
+            return 0
+
+    def _intelligent_chunking(self, text: str, page_num: int) -> List[Dict]:
+        """Intelligent chunking preserving semantic coherence"""
+        chunks = []
+        
+        # Split by major sections
+        sections = re.split(r'\n\s*\n|\n(?=[A-Z][A-Z\s]{2,}\n)', text)
+        
+        for section in sections:
+            section = section.strip()
+            if len(section) < 100:
+                continue
+            
+            # Further split by sentences if section is too long
+            if len(section) > 800:
+                sentences = re.split(r'(?<=[.!?])\s+', section)
+                current_chunk = []
+                current_length = 0
+                
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if not sentence:
+                        continue
+                    
+                    sentence_length = len(sentence)
+                    if current_length + sentence_length > 600 and current_chunk:
+                        # Save current chunk
+                        chunk_text = ' '.join(current_chunk)
+                        chunks.append({
+                            'text': chunk_text,
+                            'page': page_num,
+                            'type': 'paragraph',
+                            'tokens': self.intelligent_tokenization(chunk_text)
+                        })
+                        current_chunk = [sentence]
+                        current_length = sentence_length
+                    else:
+                        current_chunk.append(sentence)
+                        current_length += sentence_length
+                
+                # Add last chunk
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    chunks.append({
+                        'text': chunk_text,
+                        'page': page_num,
+                        'type': 'paragraph',
+                        'tokens': self.intelligent_tokenization(chunk_text)
+                    })
+            else:
+                # Section is appropriate size
+                chunks.append({
+                    'text': section,
+                    'page': page_num,
+                    'type': 'section',
+                    'tokens': self.intelligent_tokenization(section)
+                })
+        
+        return chunks
+
+    def semantic_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """Semantic search using vector database"""
+        if self.vector_db is None or len(self.text_chunks) == 0:
+            print("❌ Vector database not built or empty")
+            return []
+        
+        try:
+            # Generate query embedding
+            query_embedding = self.embedding_model.encode([query])
+            
+            # Search in vector database
+            distances, indices = self.vector_db.search(query_embedding, top_k)
+            
+            # Retrieve relevant chunks
+            results = []
+            for idx, distance in zip(indices[0], distances[0]):
+                if idx < len(self.text_chunks):
+                    chunk = self.text_chunks[idx]
+                    results.append({
+                        'text': chunk['text'],
+                        'page': chunk['page'],
+                        'score': 1.0 / (1.0 + distance),  # Convert distance to similarity
+                        'type': chunk['type'],
+                        'tokens': chunk['tokens']
+                    })
+            
+            # Sort by score
+            results.sort(key=lambda x: x['score'], reverse=True)
+            return results[:top_k]
+        
+        except Exception as e:
+            print(f"❌ Error in semantic search: {e}")
+            return []
+
+    def correct_topic_spelling(self, topic: str) -> str:
+        """Correct topic spelling using enhanced dictionary"""
+        topic_lower = topic.lower().strip()
+        
+        # Check direct matches
+        for correct_topic, data in self.programming_topics.items():
+            if topic_lower == correct_topic:
+                return correct_topic
+            
+            # Check common misspellings
+            if topic_lower in data['common_misspellings']:
+                print(f"🔤 Spelling corrected: '{topic}' -> '{correct_topic}'")
+                return correct_topic
+        
+        # Fuzzy matching
+        best_match = None
+        best_score = 0
+        
+        for correct_topic, data in self.programming_topics.items():
+            # Check if topic contains any keyword
+            for keyword in data['keywords']:
+                if keyword in topic_lower:
+                    return correct_topic
+            
+            # Sequence matching
+            similarity = SequenceMatcher(None, topic_lower, correct_topic).ratio()
+            if similarity > best_score:
+                best_score = similarity
+                best_match = correct_topic
+        
+        if best_score > 0.5:
+            print(f"🔤 Fuzzy match: '{topic}' -> '{best_match}' (score: {best_score:.2f})")
+            return best_match
+        
+        return topic_lower
+
+    def advanced_summarization(self, pdf_path: str, topic: str) -> dict:
+        """Advanced summarization with vector database"""
+        try:
+            # Correct spelling
+            corrected_topic = self.correct_topic_spelling(topic)
+            print(f"🔍 Searching for: '{corrected_topic}' (from '{topic}')")
+            
+            # Build vector database if not already built
+            if self.vector_db is None:
+                print("📚 Building vector database (first time)...")
+                num_chunks = self.build_vector_database(pdf_path)
+                if num_chunks == 0:
+                    return {
+                        'success': False,
+                        'summary': "❌ Could not extract meaningful content from PDF",
+                        'rouge_scores': None
+                    }
+            
+            # Semantic search for topic
+            print(f"🔍 Semantic search for: {corrected_topic}")
+            relevant_chunks = self.semantic_search(corrected_topic, top_k=15)
+            
+            if not relevant_chunks:
+                # Fallback: search with keywords
+                print("⚠️ Semantic search failed, trying keyword search...")
+                relevant_chunks = self._keyword_search(corrected_topic)
+            
+            if not relevant_chunks:
+                return {
+                    'success': False,
+                    'summary': f"❌ No relevant content found for '{corrected_topic}'",
+                    'rouge_scores': None
+                }
+            
+            # Combine relevant content intelligently
+            combined_content = self._combine_relevant_content(relevant_chunks, corrected_topic)
+            
+            if len(combined_content) < 200:
+                return {
+                    'success': False,
+                    'summary': f"❌ Insufficient relevant content for '{corrected_topic}'",
+                    'rouge_scores': None
+                }
+            
+            # Generate summary with advanced preprocessing
+            summary = self._generate_advanced_summary(combined_content)
+            
+            # Create reference from chunks
+            reference = self._create_reference_from_chunks(relevant_chunks)
+            
+            # Compute ROUGE scores
+            rouge_scores = self._compute_comprehensive_rouge(summary, reference, combined_content)
+            
+            return {
+                'success': True,
+                'summary': summary,
+                'reference': reference[:800] + "..." if len(reference) > 800 else reference,
+                'rouge_scores': rouge_scores,
+                'chunks_used': len(relevant_chunks),
+                'content_length': len(combined_content),
+                'pages': sorted(list(set([chunk['page'] for chunk in relevant_chunks]))),
+                'original_topic': topic,
+                'corrected_topic': corrected_topic
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'summary': f"❌ Error: {str(e)}",
+                'rouge_scores': None
+            }
+
+    def _keyword_search(self, topic: str) -> List[Dict]:
+        """Fallback keyword search if semantic search fails"""
+        results = []
+        
+        # Get keywords for the topic
+        topic_data = self.programming_topics.get(topic, {})
+        keywords = topic_data.get('keywords', [topic])
+        
+        for chunk in self.text_chunks:
+            text_lower = chunk['text'].lower()
+            score = 0
+            
+            # Score based on keyword matches
+            for keyword in keywords:
+                if keyword in text_lower:
+                    score += 1
+            
+            if score > 0:
+                results.append({
+                    'text': chunk['text'],
+                    'page': chunk['page'],
+                    'score': score,
+                    'type': chunk['type'],
+                    'tokens': chunk['tokens']
+                })
+        
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:10]
+
+    def _combine_relevant_content(self, chunks: List[Dict], topic: str) -> str:
+        """Intelligently combine relevant chunks"""
+        # Group by page for coherence
+        page_groups = {}
+        for chunk in chunks:
+            page = chunk['page']
+            if page not in page_groups:
+                page_groups[page] = []
+            page_groups[page].append(chunk)
+        
+        # Sort pages by total relevance score
+        sorted_pages = sorted(page_groups.items(), 
+                            key=lambda x: sum(c['score'] for c in x[1]), 
+                            reverse=True)
+        
+        combined_texts = []
+        total_length = 0
+        
+        for page, page_chunks in sorted_pages:
+            # Sort chunks on page by position or relevance
+            page_chunks.sort(key=lambda x: x['score'], reverse=True)
+            
+            for chunk in page_chunks:
+                if total_length + len(chunk['text']) > 2500:
+                    break
+                
+                # Add contextual information
+                context_text = f"[Page {chunk['page']}] {chunk['text']}"
+                combined_texts.append(context_text)
+                total_length += len(context_text)
+            
+            if total_length > 2500:
+                break
+        
+        return "\n\n".join(combined_texts)
+
+    def _generate_advanced_summary(self, content: str) -> str:
+        """Generate summary with advanced tokenization and BART"""
+        # Enhanced preprocessing
+        preprocessed_content = self._advanced_preprocessing(content)
+        
+        # Tokenize with custom tokenizer
+        inputs = self.tokenizer(
+            preprocessed_content,
+            max_length=1024,
+            truncation=True,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        
+        if self.device == 0:
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        # Generate summary with attention to technical terms
+        with torch.no_grad():
+            summary_ids = self.model.generate(
+                inputs['input_ids'],
+                max_length=350,
+                min_length=150,
+                length_penalty=2.0,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=3
+            )
+        
+        summary = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        
+        # Post-process summary
+        summary = self._post_process_summary(summary)
+        
+        return summary
+
+    def _advanced_preprocessing(self, text: str) -> str:
+        """Advanced text preprocessing preserving technical content"""
+        # Remove noise
+        noise_patterns = [
+            r'\b(?:Exercise|Problem|Question|Homework|Quiz)\s*\d*[.:]',
+            r'Multiple choice questions?',
+            r'True or False',
+            r'Fill in the blanks?',
+            r'Learning objectives',
+            r'Key terms',
+            r'Summary\b',
+            r'Chapter\s+\d+',
+            r'Page\s+\d+'
+        ]
+        
+        for pattern in noise_patterns:
+            text = re.sub(pattern, ' ', text, flags=re.IGNORECASE)
+        
+        # Preserve and highlight technical constructs
+        technical_highlights = [
+            (r'\b(def\s+\w+)', r'DEFINITION: \1'),
+            (r'\b(class\s+\w+)', r'CLASS: \1'),
+            (r'\b(import\s+[\w.]+)', r'IMPORT: \1'),
+            (r'\b(function\b)', r'TECH_FUNCTION'),
+            (r'\b(method\b)', r'TECH_METHOD'),
+            (r'\b(variable\b)', r'TECH_VARIABLE'),
+            (r'\b(parameter\b)', r'TECH_PARAMETER'),
+            (r'\b(argument\b)', r'TECH_ARGUMENT'),
+        ]
+        
+        for pattern, replacement in technical_highlights:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        
+        # Clean extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+
+    def _post_process_summary(self, summary: str) -> str:
+        """Post-process summary to improve readability"""
+        # Restore technical terms
+        term_mapping = {
+            'TECH_FUNCTION': 'function',
+            'TECH_METHOD': 'method',
+            'TECH_VARIABLE': 'variable',
+            'TECH_PARAMETER': 'parameter',
+            'TECH_ARGUMENT': 'argument',
+            'DEFINITION: ': '',
+            'CLASS: ': '',
+            'IMPORT: ': ''
+        }
+        
+        for tech_term, normal_term in term_mapping.items():
+            summary = summary.replace(tech_term, normal_term)
+        
+        # Ensure proper sentence structure
+        sentences = re.split(r'(?<=[.!?])\s+', summary)
+        cleaned_sentences = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 10:
+                continue
+            
+            # Capitalize first letter
+            if sentence and sentence[0].islower():
+                sentence = sentence[0].upper() + sentence[1:]
+            
+            # Ensure sentence ends properly
+            if not sentence.endswith(('.', '!', '?')):
+                sentence += '.'
+            
+            cleaned_sentences.append(sentence)
+        
+        # Remove duplicate sentences
+        unique_sentences = []
+        seen = set()
+        for sentence in cleaned_sentences:
+            simple = re.sub(r'[^\w\s]', '', sentence.lower())
+            if simple not in seen and len(simple.split()) > 3:
+                seen.add(simple)
+                unique_sentences.append(sentence)
+        
+        return ' '.join(unique_sentences[:8])  # Limit to 8 sentences
+
+    def _create_reference_from_chunks(self, chunks: List[Dict]) -> str:
+        """Create high-quality reference from chunks"""
+        # Extract key sentences from each chunk
+        key_sentences = []
+        
+        for chunk in chunks:
+            sentences = re.split(r'(?<=[.!?])\s+', chunk['text'])
+            
+            # Score sentences
+            for sentence in sentences:
+                if len(sentence.split()) < 6:
+                    continue
+                
+                score = 0
+                sentence_lower = sentence.lower()
+                
+                # Score based on technical content
+                technical_terms = ['def', 'class', 'import', 'function', 'method', 
+                                 'variable', 'parameter', 'return', 'example', 'syntax']
+                
+                for term in technical_terms:
+                    if term in sentence_lower:
+                        score += 2
+                
+                # Score based on clarity indicators
+                clarity_indicators = ['means', 'defines', 'creates', 'returns', 
+                                    'example:', 'for instance', 'specifically']
+                
+                for indicator in clarity_indicators:
+                    if indicator in sentence_lower:
+                        score += 1
+                
+                if score >= 2:
+                    key_sentences.append((sentence, score))
+        
+        # Sort by score and select top sentences
+        key_sentences.sort(key=lambda x: x[1], reverse=True)
+        selected = [s for s, _ in key_sentences[:10]]
+        
+        return ' '.join(selected)
+
+    def _compute_comprehensive_rouge(self, summary: str, reference: str, source: str) -> Dict:
+        """Compute comprehensive ROUGE metrics"""
+        try:
+            # Basic ROUGE scores
+            scores = self.rouge_scorer.score(reference, summary)
+            
+            # Calculate additional metrics
+            summary_words = len(summary.split())
+            reference_words = len(reference.split())
+            
+            # Technical term coverage
+            technical_terms = set(self._extract_technical_terms(source))
+            summary_tech_terms = set(self._extract_technical_terms(summary))
+            
+            if technical_terms:
+                tech_coverage = len(summary_tech_terms.intersection(technical_terms)) / len(technical_terms)
+            else:
+                tech_coverage = 0
+            
+            # Information density
+            compression_ratio = reference_words / max(summary_words, 1)
+            
+            # Novelty (how much new info in summary vs repeating source)
+            summary_set = set(summary.lower().split())
+            source_set = set(source.lower().split())
+            if summary_set:
+                novelty = 1 - (len(summary_set.intersection(source_set)) / len(summary_set))
+            else:
+                novelty = 0
+            
+            return {
+                'rouge1': {
+                    'precision': scores['rouge1'].precision,
+                    'recall': scores['rouge1'].recall,
+                    'f1': scores['rouge1'].fmeasure
+                },
+                'rouge2': {
+                    'precision': scores['rouge2'].precision,
+                    'recall': scores['rouge2'].recall,
+                    'f1': scores['rouge2'].fmeasure
+                },
+                'rougeL': {
+                    'precision': scores['rougeL'].precision,
+                    'recall': scores['rougeL'].recall,
+                    'f1': scores['rougeL'].fmeasure
+                },
+                'rougeLsum': {
+                    'precision': scores['rougeLsum'].precision,
+                    'recall': scores['rougeLsum'].recall,
+                    'f1': scores['rougeLsum'].fmeasure
+                },
+                'quality_metrics': {
+                    'technical_coverage': tech_coverage,
+                    'compression_ratio': compression_ratio,
+                    'novelty_score': novelty,
+                    'summary_length': summary_words,
+                    'reference_length': reference_words,
+                    'unique_technical_terms': len(summary_tech_terms)
+                }
+            }
+        except Exception as e:
+            print(f"Error computing ROUGE: {e}")
+            return None
+
+    def _extract_technical_terms(self, text: str) -> List[str]:
+        """Extract technical/programming terms from text"""
+        technical_patterns = [
+            r'\bdef\s+(\w+)',  # Function definitions
+            r'\bclass\s+(\w+)',  # Class definitions
+            r'\b(\w+)\s*\([^)]*\)',  # Function calls
+            r'\b(\w+)\.\w+\b',  # Method calls
+            r'\b(?:int|float|str|list|dict|tuple|set|bool)\b',  # Data types
+            r'\b(?:import|from|as|return|yield|raise|assert)\b',  # Keywords
+        ]
+        
+        technical_terms = []
+        for pattern in technical_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            technical_terms.extend(matches)
+        
+        # Also include common programming terms
+        common_terms = {
+            'function', 'method', 'variable', 'parameter', 'argument',
+            'object', 'class', 'instance', 'attribute', 'inheritance',
+            'polymorphism', 'encapsulation', 'abstraction', 'interface',
+            'module', 'package', 'library', 'framework', 'algorithm'
+        }
+        
+        for term in common_terms:
+            if term in text.lower():
+                technical_terms.append(term)
+        
+        return list(set(technical_terms))
+
+# Initialize the advanced summarizer
+advanced_summarizer = AdvancedTextbookSummarizer()
+
+def advanced_summary_handler(uploaded_file, topic):
+    """Handler for advanced summarization with vector DB"""
+    if uploaded_file is None:
+        return "❌ Please upload a PDF file", "Waiting for file...", "No ROUGE scores available"
+    
+    try:
+        pdf_path = uploaded_file.name
+        
+        # Get advanced summary
+        result = advanced_summarizer.advanced_summarization(pdf_path, topic)
+        
+        # Format output
+        if result['success']:
+            original_topic = result.get('original_topic', topic)
+            corrected_topic = result.get('corrected_topic', topic)
+            
+            spelling_info = ""
+            if original_topic.lower() != corrected_topic.lower():
+                spelling_info = f"\n🔤 Spelling corrected: '{original_topic}' → '{corrected_topic}'"
+            
+            output = [
+                "=" * 80,
+                "🚀 ADVANCED TEXTBOOK SUMMARIZATION",
+                "=" * 80,
+                f"📚 Original Topic: '{original_topic}'",
+                f"🎯 Searching: '{corrected_topic}'{spelling_info}",
+                f"📊 Chunks used: {result.get('chunks_used', 0)}",
+                f"📄 Content length: {result.get('content_length', 0)} chars",
+                f"📖 Pages: {result.get('pages', [])}",
+                "=" * 80,
+                "",
+                "🎯 GENERATED SUMMARY (with enhanced tokenization):",
+                "-" * 40,
+                result['summary'],
+                "",
+                "📋 REFERENCE (from vector DB retrieval):",
+                "-" * 40,
+                result.get('reference', 'No reference'),
+                ""
+            ]
+            
+            summary_output = "\n".join(output)
+            
+            # Status info
+            status_info = f"✅ Success: Advanced summarization\n"
+            status_info += f"📊 Chunks retrieved: {result.get('chunks_used', 0)}\n"
+            status_info += f"📖 Pages covered: {len(result.get('pages', []))}\n"
+            status_info += f"🔍 Method: Vector DB + Semantic Search\n"
+            status_info += f"⚡ Tokenization: Intelligent + Technical\n"
+            
+            # ROUGE scores
+            if result.get('rouge_scores'):
+                rouge = result['rouge_scores']
+                quality = rouge['quality_metrics']
+                
+                # Determine quality label
+                rouge1_f1 = rouge['rouge1']['f1']
+                if rouge1_f1 > 0.35:
+                    quality_label = "🌟 EXCELLENT"
+                elif rouge1_f1 > 0.25:
+                    quality_label = "✅ GOOD"
+                elif rouge1_f1 > 0.15:
+                    quality_label = "⚠️ FAIR"
+                else:
+                    quality_label = "🔧 NEEDS IMPROVEMENT"
+                
+                rouge_output = [
+                    "=" * 80,
+                    "📊 COMPREHENSIVE ROUGE SCORES",
+                    "=" * 80,
+                    "",
+                    "🎯 ROUGE METRICS (F1 Scores):",
+                    "-" * 40,
+                    f"ROUGE-1:   {rouge['rouge1']['f1']:.3f}",
+                    f"ROUGE-2:   {rouge['rouge2']['f1']:.3f}",
+                    f"ROUGE-L:   {rouge['rougeL']['f1']:.3f}",
+                    f"ROUGE-Lsum: {rouge['rougeLsum']['f1']:.3f}",
+                    "",
+                    "📈 QUALITY METRICS:",
+                    "-" * 40,
+                    f"Technical Coverage:    {quality['technical_coverage']:.1%}",
+                    f"Compression Ratio:     {quality['compression_ratio']:.2f}x",
+                    f"Novelty Score:         {quality['novelty_score']:.3f}",
+                    f"Summary Length:        {quality['summary_length']} words",
+                    f"Reference Length:      {quality['reference_length']} words",
+                    f"Technical Terms:       {quality['unique_technical_terms']}",
+                    "",
+                    "💡 INTERPRETATION:",
+                    "-" * 40,
+                    "• Technical Coverage > 60%: Good concept retention",
+                    "• Compression 3-8x: Ideal summary length",
+                    "• Novelty 0.3-0.6: Balanced new info vs repetition",
+                    "• ROUGE-1 > 0.35: High semantic similarity",
+                    "",
+                    f"🏆 OVERALL QUALITY: {quality_label}",
+                    "=" * 80
+                ]
+                rouge_scores_text = "\n".join(rouge_output)
+            else:
+                rouge_scores_text = "📊 ROUGE scores not available"
+            
+        else:
+            summary_output = result['summary']
+            status_info = "❌ Summarization failed"
+            rouge_scores_text = "No ROUGE scores available"
+        
+        return summary_output, status_info, rouge_scores_text
+    
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        return error_msg, f"Error: {str(e)}", "No ROUGE scores available"
+
+# Create advanced interface
+advanced_iface = gr.Interface(
+    fn=advanced_summary_handler,
+    inputs=[
+        gr.File(label="📚 Upload Textbook PDF", file_types=[".pdf"]),
+        gr.Textbox(
+            label="🎯 Enter Topic",
+            value="functions",
+            placeholder="e.g., functions, variables, lists, objects, inheritance, dictionaries..."
+        )
+    ],
+    outputs=[
+        gr.Textbox(label="🚀 Advanced Summary", lines=22),
+        gr.Textbox(label="🔧 Processing Info", lines=6),
+        gr.Textbox(label="📊 Comprehensive ROUGE", lines=25)
+    ],
+    title="🚀 Advanced Textbook Summarizer with Vector DB",
+    description="Intelligent tokenization + Semantic search + Vector database + Comprehensive ROUGE",
+    allow_flagging="never"
+)
+
+print("🚀 Launching ADVANCED Textbook Summarizer...")
+print("📁 First upload builds vector database (takes 30-60 seconds)")
+print("🎯 Subsequent searches are FAST via semantic retrieval")
+print("🔍 Intelligent tokenization preserves technical context")
+print("📊 Comprehensive ROUGE scores with quality metrics")
+
+# Launch interface
+advanced_iface.launch(share=True)
